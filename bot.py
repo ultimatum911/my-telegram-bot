@@ -1,120 +1,136 @@
-import asyncio
-import aiohttp
 import os
-from telegram import Bot
-from flask import Flask
+import time
+import asyncio
 import threading
+import logging
+from typing import Optional, Tuple
 
-# === CONFIG ===
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Set in Fly.io secrets
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")  # Set in Fly.io secrets
-# How often to poll the Nobitex API for price updates (in seconds)
-INTERVAL = 30  # seconds
+import requests
+from telegram import Bot
+from telegram.constants import ParseMode
+from flask import Flask
 
-# Percentage change threshold to trigger a new message.  If the price moves by
-# this percentage (up or down) compared to the last recorded price during the
-# polling interval, a new message will be sent.  For example, a value of
-# 0.2 means a 0.2% change.
-PRICE_CHANGE_PERCENT_THRESHOLD = 0.2  # percent
+# ---------------- CONFIG ----------------
+INTERVAL_SECONDS = 30
+THRESHOLD_PERCENT = 0.2  # 0.2% move within 30 seconds
 
-bot = Bot(token=BOT_TOKEN)
-last_price = None  # Tracks the last observed price to compute percentage changes
+NOBITEX_URL = "https://apiv2.nobitex.ir/market/stats"
+NOBITEX_PARAMS = {"srcCurrency": "usdt", "dstCurrency": "rls"}
+USER_AGENT = "TraderBot/1.0"
 
-# We no longer use the `alert_sent` flag or fixed Rial change threshold.
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")  # e.g. @yourchannel OR -1001234567890
 
+# -------------- LOGGING ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("nobitex-bot")
 
-# --- Flask server to keep Fly.io happy ---
+# -------------- OPTIONAL HTTP SERVER (for Render Web Service) --------------
 app = Flask(__name__)
 
-@app.route("/")
+@app.get("/")
 def home():
     return "Bot is running!"
 
-def run_flask():
-    app.run(host="0.0.0.0", port=8080)
-
-# --- Bot functions ---
-async def fetch_price(session):
-    url = "https://apiv2.nobitex.ir/market/stats"
-    params = {"srcCurrency": "usdt", "dstCurrency": "rls"}
-    headers = {"User-Agent": "TraderBot/1.0"}
-
-    try:
-        async with session.get(url, params=params, headers=headers, timeout=10) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            stats = data.get("stats", {})
-            usdt_rls = stats.get("usdt-rls")
-            if usdt_rls is None:
-                raise ValueError("Data missing")
-
-            latest = int(usdt_rls.get("latest"))
-            bestBuy = int(usdt_rls.get("bestBuy"))
-            bestSell = int(usdt_rls.get("bestSell"))
-
-            message = (
-                f"💵 USDT/Rial — Latest: `{latest}`\n"
-                f"🛒 Buy: `{bestBuy}` | 💰 Sell: `{bestSell}`\n"
-                "──────────────"
-            )
-            return message, latest
-    except Exception as e:
-        print("Fetch error:", e)
-        return f"Error fetching price: {e}", None
-
-async def send_message_safe(text):
-    try:
-        await bot.send_message(chat_id=CHANNEL_USERNAME, text=text, parse_mode="Markdown")
-    except Exception as e:
-        print("Send error:", e)
-
-async def main_loop():
-    """Main polling loop.
-
-    This function continuously polls the Nobitex API for the USDT/Rial rate.  If the
-    price has changed by more than `PRICE_CHANGE_PERCENT_THRESHOLD` percent (either
-    up or down) compared to the last recorded price, a message containing the
-    latest price information is sent to the Telegram channel.  Otherwise, no
-    message is sent.  The first fetched price is always sent to provide a
-    baseline for subsequent comparisons.
+def run_http_server_if_needed():
     """
-    global last_price
-    async with aiohttp.ClientSession() as session:
-        while True:
-            # Fetch the latest price data from the API
-            message, current_price = await fetch_price(session)
+    Render Web Services expect you to bind to $PORT.
+    Background Workers usually don't set PORT.
+    """
+    port = os.getenv("PORT")
+    if not port:
+        return
+    try:
+        p = int(port)
+    except ValueError:
+        p = 8080
 
-            # Only act if we received a valid current price
-            if current_price is not None:
-                # If this is the first price fetch, send the message and set baseline
-                if last_price is None:
-                    await send_message_safe(message)
-                    print("Initial price sent:", message)
-                    last_price = current_price
+    log.info("Starting HTTP server on port %s", p)
+    # use_reloader=False prevents double-start
+    app.run(host="0.0.0.0", port=p, use_reloader=False)
+
+# ---------------- NOBITEX FETCH ----------------
+def fetch_price_sync() -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    Returns: (latest, best_buy, best_sell) as ints, or (None, None, None) on failure
+    """
+    try:
+        r = requests.get(
+            NOBITEX_URL,
+            params=NOBITEX_PARAMS,
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        stats = data.get("stats", {})
+        pair = stats.get("usdt-rls")
+        if not pair:
+            raise ValueError("Missing stats['usdt-rls']")
+
+        latest = int(pair["latest"])
+        best_buy = int(pair["bestBuy"])
+        best_sell = int(pair["bestSell"])
+        return latest, best_buy, best_sell
+
+    except Exception as e:
+        log.warning("Fetch error: %s", e)
+        return None, None, None
+
+# ---------------- TELEGRAM ----------------
+async def send_message(bot: Bot, text: str) -> None:
+    try:
+        await bot.send_message(
+            chat_id=CHANNEL_USERNAME,
+            text=text,
+            parse_mode=ParseMode.HTML,  # safe formatting
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.warning("Send error: %s", e)
+
+def format_message(latest: int, best_buy: int, best_sell: int, pct: float) -> str:
+    arrow = "🔺" if pct > 0 else "🔻"
+    return (
+        f"{arrow} <b>USDT/Rial moved {pct:+.3f}% in {INTERVAL_SECONDS}s</b>\n"
+        f"Latest: <b>{latest}</b>\n"
+        f"Buy: {best_buy} | Sell: {best_sell}"
+    )
+
+# ---------------- MAIN LOOP ----------------
+async def main():
+    if not BOT_TOKEN or not CHANNEL_USERNAME:
+        raise RuntimeError(
+            "Missing env vars. Set BOT_TOKEN and CHANNEL_USERNAME in Render Environment."
+        )
+
+    bot = Bot(token=BOT_TOKEN)
+
+    prev_latest: Optional[int] = None
+
+    while True:
+        latest, best_buy, best_sell = await asyncio.to_thread(fetch_price_sync)
+
+        if latest is not None:
+            if prev_latest is not None and prev_latest != 0:
+                pct_change = (latest - prev_latest) / prev_latest * 100.0
+
+                if abs(pct_change) >= THRESHOLD_PERCENT:
+                    msg = format_message(latest, best_buy, best_sell, pct_change)
+                    await send_message(bot, msg)
+                    log.info("Sent alert: %+.3f%% (%s -> %s)", pct_change, prev_latest, latest)
                 else:
-                    # Calculate the absolute percentage change relative to the last recorded price
-                    diff = abs(current_price - last_price)
-                    percent_change = (diff / last_price) * 100 if last_price != 0 else 0
+                    log.info("No alert: %+.4f%% (threshold %.3f%%)", pct_change, THRESHOLD_PERCENT)
 
-                    # If the percentage change exceeds the threshold, send a message
-                    if percent_change >= PRICE_CHANGE_PERCENT_THRESHOLD:
-                        await send_message_safe(message)
-                        print(
-                            f"Price changed by {percent_change:.3f}% (threshold {PRICE_CHANGE_PERCENT_THRESHOLD}%), message sent: {message}"
-                        )
-                        # Update last_price to the new price after sending the alert
-                        last_price = current_price
-                    else:
-                        # Price change is below the threshold; do nothing (no message sent)
-                        print(
-                            f"Price change {percent_change:.3f}% is below threshold {PRICE_CHANGE_PERCENT_THRESHOLD}%, no message sent"
-                        )
+            prev_latest = latest
 
-            # Wait for the configured interval before the next poll
-            await asyncio.sleep(INTERVAL)
+        await asyncio.sleep(INTERVAL_SECONDS)
 
-# --- Run Flask + Bot ---
 if __name__ == "__main__":
-    threading.Thread(target=run_flask).start()
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main_loop())
+    # Start tiny HTTP server if PORT is present (Render Web Service case)
+    threading.Thread(target=run_http_server_if_needed, daemon=True).start()
+    asyncio.run(main())
