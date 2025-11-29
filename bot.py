@@ -11,8 +11,8 @@ from telegram.constants import ParseMode
 from flask import Flask
 
 # ---------------- CONFIG ----------------
-INTERVAL_SECONDS = 30
-THRESHOLD_PERCENT = 0.2  # 0.2% move within 30 seconds
+INTERVAL_SECONDS = 60
+THRESHOLD_PERCENT = 0.00001  # 0.1% move within 60 seconds
 
 NOBITEX_URL = "https://apiv2.nobitex.ir/market/stats"
 NOBITEX_PARAMS = {"srcCurrency": "usdt", "dstCurrency": "rls"}
