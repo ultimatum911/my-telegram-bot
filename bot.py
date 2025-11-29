@@ -136,10 +136,10 @@ async def send_message(bot: Bot, chat_id, text: str) -> None:
 def format_message(latest: int, best_buy: int, best_sell: int, pct: float) -> str:
     arrow = "🟢▲" if pct > 0 else "🔻"
     return (
-        f"{arrow} <b>USDT/Rial moved {pct:+.3f}% in {INTERVAL_SECONDS}s</b>\n"
-        f"Latest: <b>{latest}</b>\n"
+        f"{arrow} USDT/Rial {pct:+.3f}% in {INTERVAL_SECONDS}s\n"
+        f"Latest: {latest}\n"
         f"Buy: {best_buy} | Sell: {best_sell}"
-    )
+        )
 
 # ---------------- MAIN LOOP ----------------
 async def main():
