@@ -134,7 +134,7 @@ async def send_message(bot: Bot, chat_id, text: str) -> None:
         log.warning("Send error: %s", e)
 
 def format_message(latest: int, best_buy: int, best_sell: int, pct: float) -> str:
-    arrow = "🔺" if pct > 0 else "🔻"
+    arrow = "🟢▲" if pct > 0 else "🔻"
     return (
         f"{arrow} <b>USDT/Rial moved {pct:+.3f}% in {INTERVAL_SECONDS}s</b>\n"
         f"Latest: <b>{latest}</b>\n"
