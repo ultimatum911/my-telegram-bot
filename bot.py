@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import threading
 import logging
@@ -14,12 +15,7 @@ from telegram.constants import ParseMode
 INTERVAL_SECONDS = 60
 THRESHOLD_PERCENT = 0.1  # post if moved +/-0.1% within 60 seconds
 
-# Primary endpoint (what you use)
-NOBITEX_URL_V2 = "https://apiv2.nobitex.ir/market/stats"
-
-# Fallback endpoint (per docs)
-NOBITEX_URL_V1 = "https://api.nobitex.ir/market/stats"
-
+NOBITEX_URL = "https://apiv2.nobitex.ir/market/stats"
 NOBITEX_PARAMS = {"srcCurrency": "usdt", "dstCurrency": "rls"}
 PAIR_KEY = "usdt-rls"
 USER_AGENT = "TraderBot/1.0"
@@ -61,16 +57,12 @@ def parse_chat_id(value: str):
         return v
 
 def to_int_price(x) -> int:
-    """
-    Handles values like: "1157100" or "1157100.0000000000"
-    """
     if x is None:
         raise ValueError("price is None")
     try:
         d = Decimal(str(x))
     except InvalidOperation:
         raise ValueError(f"invalid price: {x}")
-    # truncate fractional part safely
     return int(d.to_integral_value(rounding="ROUND_DOWN"))
 
 # ---------------- NOBITEX FETCH ----------------
@@ -78,7 +70,6 @@ def fetch_price_sync() -> Tuple[Optional[int], Optional[int], Optional[int], int
     """
     Returns: (latest, best_buy, best_sell, backoff_seconds)
     """
-
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
@@ -86,51 +77,40 @@ def fetch_price_sync() -> Tuple[Optional[int], Optional[int], Optional[int], int
         "Pragma": "no-cache",
     }
 
-    # ---- 1) Try apiv2 with GET + params (with cache buster) ----
     try:
+        # cache buster to reduce stale responses
         params = dict(NOBITEX_PARAMS)
-        params["_ts"] = str(int(asyncio.get_event_loop().time() * 1000)) if asyncio.get_event_loop().is_running() else "0"
+        params["_ts"] = str(int(time.time() * 1000))
 
-        r = requests.get(NOBITEX_URL_V2, params=params, headers=headers, timeout=10)
+        r = requests.get(NOBITEX_URL, params=params, headers=headers, timeout=10)
+
+        if r.status_code == 429:
+            # rate-limit handling (if the API returns JSON with backOff)
+            backoff = 60
+            try:
+                data = r.json()
+                backoff = int(data.get("backOff", 60))
+            except Exception:
+                pass
+            log.warning("Rate-limited (429). backOff=%ss", backoff)
+            return None, None, None, backoff
+
         r.raise_for_status()
         data = r.json()
 
-        # Some Nobitex responses include status/backOff; handle if present
+        # handle non-ok responses if present
         if isinstance(data, dict) and data.get("status") and data.get("status") != "ok":
             backoff = int(data.get("backOff", 0) or 0)
-            log.warning("apiv2 status=%s code=%s message=%s backOff=%s",
-                        data.get("status"), data.get("code"), data.get("message"), backoff)
+            log.warning(
+                "API returned status=%s code=%s message=%s backOff=%s",
+                data.get("status"), data.get("code"), data.get("message"), backoff
+            )
             return None, None, None, backoff
 
         stats = data.get("stats", {}) if isinstance(data, dict) else {}
         pair = stats.get(PAIR_KEY)
-        if pair:
-            latest = to_int_price(pair.get("latest"))
-            best_buy = to_int_price(pair.get("bestBuy"))
-            best_sell = to_int_price(pair.get("bestSell"))
-            return latest, best_buy, best_sell, 0
-
-        log.warning("apiv2 did not include stats['%s']. Falling back...", PAIR_KEY)
-
-    except Exception as e:
-        log.warning("apiv2 fetch error: %s (falling back)", e)
-
-    # ---- 2) Fallback to official API with POST (per docs) ----
-    try:
-        r = requests.post(NOBITEX_URL_V1, data=NOBITEX_PARAMS, headers=headers, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-
-        if data.get("status") != "ok":
-            backoff = int(data.get("backOff", 0) or 0)
-            log.warning("api(v1) status=%s code=%s message=%s backOff=%s",
-                        data.get("status"), data.get("code"), data.get("message"), backoff)
-            return None, None, None, backoff
-
-        stats = data.get("stats", {})
-        pair = stats.get(PAIR_KEY)
         if not pair:
-            raise ValueError(f"Missing stats['{PAIR_KEY}'] on fallback API")
+            raise ValueError(f"Missing stats['{PAIR_KEY}']")
 
         latest = to_int_price(pair.get("latest"))
         best_buy = to_int_price(pair.get("bestBuy"))
@@ -138,7 +118,7 @@ def fetch_price_sync() -> Tuple[Optional[int], Optional[int], Optional[int], int
         return latest, best_buy, best_sell, 0
 
     except Exception as e:
-        log.warning("api(v1) fetch error: %s", e)
+        log.warning("Fetch error: %s", e)
         return None, None, None, 0
 
 # ---------------- TELEGRAM ----------------
@@ -182,8 +162,10 @@ async def main():
         if latest is not None:
             if prev_latest is not None and prev_latest != 0:
                 pct_change = (latest - prev_latest) / prev_latest * 100.0
-                log.info("Tick: latest=%s prev=%s bestBuy=%s bestSell=%s change=%+.4f%%",
-                         latest, prev_latest, best_buy, best_sell, pct_change)
+                log.info(
+                    "Tick: latest=%s prev=%s bestBuy=%s bestSell=%s change=%+.4f%%",
+                    latest, prev_latest, best_buy, best_sell, pct_change
+                )
 
                 if abs(pct_change) >= THRESHOLD_PERCENT:
                     msg = format_message(latest, best_buy, best_sell, pct_change)
@@ -191,6 +173,8 @@ async def main():
                     log.info("Sent alert: %+.4f%%", pct_change)
                 else:
                     log.info("No alert (threshold %.3f%%).", THRESHOLD_PERCENT)
+            else:
+                log.info("Baseline set: latest=%s bestBuy=%s bestSell=%s", latest, best_buy, best_sell)
 
             prev_latest = latest
 
