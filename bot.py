@@ -13,7 +13,7 @@ from telegram.constants import ParseMode
 
 # ---------------- CONFIG ----------------
 INTERVAL_SECONDS = 60
-THRESHOLD_PERCENT = 0.01  # post if moved +/-0.1% within 60 seconds
+THRESHOLD_PERCENT = 0.1  # post if moved +/-0.1% within 60 seconds
 
 NOBITEX_URL = "https://apiv2.nobitex.ir/market/stats"
 NOBITEX_PARAMS = {"srcCurrency": "usdt", "dstCurrency": "rls"}
